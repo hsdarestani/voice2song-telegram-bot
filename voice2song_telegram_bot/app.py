@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import requests
+from venice_client import VeniceMusicClient, VeniceMusicError, VeniceMusicTimeout
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -81,8 +82,20 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
 DEFAULT_STYLE = os.getenv("DEFAULT_STYLE", "random").strip() or "random"
 SOUNDFONT_PATH = os.getenv("SOUNDFONT_PATH", "").strip()
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "30"))
-MIN_MELODY_NOTES = int(os.getenv("MIN_MELODY_NOTES", "5"))
+MIN_MELODY_NOTES = int(os.getenv("MIN_MELODY_NOTES", "4"))
 SEND_VARIATION = os.getenv("SEND_VARIATION", "true").lower() in {"1", "true", "yes", "on"}
+SEND_MIDI_ADVANCED = os.getenv("SEND_MIDI_ADVANCED", "false").lower() in {"1", "true", "yes", "on"}
+MUSIC_BACKEND = os.getenv("MUSIC_BACKEND", "venice").strip().lower()
+VENICE_API_KEY = os.getenv("VENICE_API_KEY", "").strip()
+VENICE_BASE_URL = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1").strip()
+VENICE_MUSIC_MODEL = os.getenv("VENICE_MUSIC_MODEL", "ace-step-15").strip()
+VENICE_FALLBACK_MODEL = os.getenv("VENICE_FALLBACK_MODEL", "minimax-music-v2").strip()
+VENICE_DURATION_SECONDS = int(os.getenv("VENICE_DURATION_SECONDS", "60"))
+VENICE_MAX_POLL_SECONDS = int(os.getenv("VENICE_MAX_POLL_SECONDS", "360"))
+VENICE_POLL_INTERVAL_SECONDS = int(os.getenv("VENICE_POLL_INTERVAL_SECONDS", "5"))
+VENICE_USE_QUOTE = os.getenv("VENICE_USE_QUOTE", "true").lower() in {"1", "true", "yes", "on"}
+VENICE_COMPLETE_AFTER_DOWNLOAD = os.getenv("VENICE_COMPLETE_AFTER_DOWNLOAD", "true").lower() in {"1", "true", "yes", "on"}
+MIDI_FALLBACK_ENABLED = os.getenv("MIDI_FALLBACK_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 RENDER_QUALITY = os.getenv("RENDER_QUALITY", "standard").strip()
 RAW_VOCAL_MIX = os.getenv("RAW_VOCAL_MIX", "false").lower() in {"1", "true", "yes", "on"}
 
@@ -317,6 +330,13 @@ class DB:
             ("confidence", "confidence REAL"),
             ("processing_time", "processing_time REAL"),
             ("debug_json", "debug_json TEXT NOT NULL DEFAULT ''"),
+            ("backend", "backend TEXT"),
+            ("model", "model TEXT"),
+            ("queue_id", "queue_id TEXT"),
+            ("quote_usd", "quote_usd REAL"),
+            ("prompt", "prompt TEXT"),
+            ("processing_seconds", "processing_seconds REAL"),
+            ("analysis_json", "analysis_json TEXT"),
         ]:
             add_col("conversions", name, ddl)
         self.conn.commit()
@@ -325,8 +345,8 @@ class DB:
         defaults = {
             "bot_title": "ربات تبدیل وویس به آهنگ",
             "welcome_text": (
-                "سلام! من وویس، آواز یا فایل صوتی کوتاهت رو به MIDI و یک آهنگ MP3 ساده تبدیل می‌کنم.\n\n"
-                "برای شروع یک وویس واضح بفرست یا از منوی پایین گزینه تبدیل را بزن."
+                "سلام! من وویس، آواز یا فایل صوتی کوتاهت رو تحلیل می‌کنم و با هوش مصنوعی یک آهنگ کامل و تمپودار می‌سازم.\n\n"
+                "برای شروع یک وویس واضح بفرست یا از منوی پایین گزینه ساخت آهنگ را بزن."
             ),
             "support_text": "برای پشتیبانی به آیدی @your_support پیام بدهید.",
             "admin_telegram_id": os.getenv("ADMIN_TELEGRAM_ID", ""),
@@ -579,6 +599,12 @@ class ProcessResult:
     confidence: float
     variation_mp3_path: Optional[Path]
     debug: Dict[str, Any]
+    backend: str = "midi"
+    model: str = ""
+    queue_id: str = ""
+    quote_usd: Optional[float] = None
+    prompt: str = ""
+    analysis_json: str = ""
 
 
 def convert_to_wav(input_path: Path, wav_path: Path) -> int:
@@ -876,6 +902,108 @@ def synthesize_midi_to_mp3(midi_path: Path, wav_path: Path, mp3_path: Path) -> N
     if proc.returncode!=0: raise RuntimeError("ffmpeg mp3 failed: "+proc.stderr[-1000:])
 
 
+
+def analyze_audio_brief(wav_path: Path) -> Dict[str, Any]:
+    """Analyze user voice locally; never sends raw voice to Venice."""
+    duration = float(max(probe_duration_seconds(wav_path), 0))
+    analysis: Dict[str, Any] = {"duration": duration, "note_count": 0, "pitch_range": 0, "energy": 0.0, "mood": "chill", "weak_voice": False}
+    try:
+        sr, data = wavfile.read(str(wav_path))
+        arr = data.astype(np.float32)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        if arr.size:
+            peak = float(np.max(np.abs(arr))) or 1.0
+            norm = arr / peak
+            rms = float(np.sqrt(np.mean(norm ** 2)))
+            analysis["energy"] = round(rms, 4)
+            if rms < 0.035:
+                analysis["mood"] = "chill"
+            elif rms > 0.16:
+                analysis["mood"] = "energetic"
+            else:
+                analysis["mood"] = "emotional"
+    except Exception as exc:
+        analysis["audio_error"] = str(exc)[:200]
+    try:
+        melody = extract_melody(wav_path)
+        music = analyze_melody(melody, "random")
+        analysis.update({
+            "note_count": melody.melody_note_count,
+            "pitch_range": melody.pitch_range,
+            "density": round(melody.density, 3),
+            "confidence": round(melody.confidence_like_score, 3),
+            "bpm": round(music.bpm),
+            "key": music.key_name,
+            "mode": music.mode,
+            "mood": "dark" if music.mode == "minor" else analysis.get("mood", "emotional"),
+            "raw_midi_path": str(melody.raw_midi_path),
+        })
+    except Exception as exc:
+        analysis["weak_voice"] = True
+        analysis["melody_error"] = str(exc)[:300]
+    return analysis
+
+
+def choose_random_style_from_analysis(audio_analysis: Dict[str, Any]) -> str:
+    energy = float(audio_analysis.get("energy") or 0)
+    density = float(audio_analysis.get("density") or 0)
+    mode = str(audio_analysis.get("mode") or "")
+    if energy < 0.05:
+        return random.choice(["lofi", "piano"])
+    if energy > 0.14 or density > 2.2:
+        return random.choice(["trap", "electronic"])
+    if mode == "minor" or audio_analysis.get("mood") == "dark":
+        return "dark_pop"
+    return "dark_pop"
+
+
+def build_venice_music_prompt(style: str, audio_analysis: Dict[str, Any], user_language: str = "fa") -> str:
+    actual_style = choose_random_style_from_analysis(audio_analysis) if style == "random" else style
+    templates = {
+        "lofi": "Create a polished lo-fi hip hop instrumental inspired by a short hummed melody idea. Warm dusty keys, soft vinyl texture, gentle sidechain, relaxed but clear tempo, emotional simple lead motif, mellow bass, soft drums, cozy night mood. No vocals. Radio-ready clean mix.",
+        "trap": "Create a polished modern trap instrumental inspired by a short hummed melody idea. Catchy lead motif, strong 808 bass, crisp hi-hat rolls, punchy snare, dark melodic chords, clear tempo and bounce, cinematic atmosphere. No vocals. Professional streaming-ready mix.",
+        "dark_pop": "Create a polished dark pop instrumental inspired by a short hummed melody idea. Emotional minor-key chords, catchy lead motif, modern punchy drums, deep bass, atmospheric pads, dramatic but clean arrangement, strong tempo. No vocals. Professional commercial mix.",
+        "electronic": "Create a polished electronic dance instrumental inspired by a short hummed melody idea. Clear dance tempo, strong kick, sidechained synth chords, catchy lead hook, modern bass, energetic build and drop, clean club-ready mix. No vocals.",
+        "piano": "Create a polished emotional piano instrumental inspired by a short hummed melody idea. Expressive piano lead, soft strings/pads, cinematic harmonic movement, gentle rhythm, emotional and memorable, clear musical phrasing. No vocals. Clean intimate mix.",
+    }
+    parts = [templates.get(actual_style, templates["dark_pop"])]
+    if audio_analysis.get("bpm"):
+        parts.append(f"Aim for around {int(audio_analysis['bpm'])} BPM.")
+    if audio_analysis.get("key"):
+        parts.append(f"Use a harmony in or around {audio_analysis['key']}.")
+    if int(audio_analysis.get("pitch_range") or 0) >= 12:
+        parts.append("Use an expressive rising and falling melody contour.")
+    else:
+        parts.append("Use a simple memorable hook based on the mood of the voice idea.")
+    if audio_analysis.get("weak_voice"):
+        parts.append("The source idea was very simple or unclear, so create a mood-based instrumental inspired by a simple hummed/whispered idea rather than copying exact notes.")
+    parts.append("Strong clear tempo, complete song structure with intro, main section, and outro, no raw voice, no vocals, no speech, no random noise.")
+    return " ".join(parts)
+
+
+def master_ai_audio(input_path: Path, output_path: Path, duration_seconds: int) -> None:
+    fade_start = max(float(duration_seconds or probe_duration_seconds(input_path)) - 1.5, 0)
+    af = f"loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.95,afade=t=in:st=0:d=0.2,afade=t=out:st={fade_start:.2f}:d=1.5"
+    proc = run_cmd(["ffmpeg", "-y", "-i", str(input_path), "-af", af, "-codec:a", "libmp3lame", "-b:a", "192k", str(output_path)], timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg Venice mastering failed: " + proc.stderr[-1000:])
+
+
+def persian_venice_error(exc: Exception) -> str:
+    if isinstance(exc, ValueError) and str(exc):
+        return str(exc)
+    if isinstance(exc, VeniceMusicTimeout):
+        return "ساخت آهنگ بیشتر از حد معمول طول کشید. لطفاً دوباره امتحان کن."
+    if isinstance(exc, VeniceMusicError):
+        if exc.status_code == 402:
+            return "اعتبار سرویس ساخت آهنگ کافی نیست. لطفاً بعداً امتحان کن."
+        if exc.status_code == 429:
+            return "سرویس شلوغه. چند دقیقه دیگه دوباره امتحان کن."
+        if exc.status_code in {401, 500, 503}:
+            return "سرویس ساخت آهنگ حرفه‌ای موقتاً در دسترس نیست. چند دقیقه دیگه دوباره امتحان کن."
+    return "سرویس ساخت آهنگ حرفه‌ای موقتاً در دسترس نیست. چند دقیقه دیگه دوباره امتحان کن."
+
 def process_audio_to_song(input_path: Path, conversion_id: int, style: str = "random") -> ProcessResult:
     if RAW_VOCAL_MIX:
         logger.warning("RAW_VOCAL_MIX is true but raw vocal mixing is intentionally not implemented/enabled in this pipeline")
@@ -884,20 +1012,92 @@ def process_audio_to_song(input_path: Path, conversion_id: int, style: str = "ra
         outdir = OUTPUTS_DIR / str(conversion_id); outdir.mkdir(parents=True, exist_ok=True)
         wav_path = outdir / "input.wav"; arranged_midi_path = outdir / "song_arranged.mid"; mp3_path = outdir / "song.mp3"
         duration = convert_to_wav(input_path, wav_path)
+        if duration < 2:
+            raise ValueError("وویست خیلی کوتاهه. لطفاً حداقل ۲ ثانیه زمزمه یا ملودی بفرست.")
+
+        if MUSIC_BACKEND == "venice":
+            if not VENICE_API_KEY:
+                raise VeniceMusicError("VENICE_API_KEY is not configured", status_code=401)
+            audio_analysis = analyze_audio_brief(wav_path)
+            selected = style if style in STYLE_PRESETS else DEFAULT_STYLE
+            actual_style = choose_random_style_from_analysis(audio_analysis) if selected == "random" else selected
+            prompt = build_venice_music_prompt(actual_style, audio_analysis)
+            model = VENICE_MUSIC_MODEL
+            client = VeniceMusicClient(VENICE_API_KEY, VENICE_BASE_URL, timeout=90)
+            quote_usd = None
+            if VENICE_USE_QUOTE:
+                try:
+                    quote_usd = client.quote(model, VENICE_DURATION_SECONDS, character_count=len(prompt))
+                except Exception as exc:
+                    logger.warning("Venice quote failed without secrets: %s", type(exc).__name__)
+            queue_id = client.queue_music(model, prompt, VENICE_DURATION_SECONDS, force_instrumental=True, lyrics_prompt="", lyrics_optimizer=False)
+            raw_path = outdir / "venice_raw.bin"
+            deadline = time.monotonic() + VENICE_MAX_POLL_SECONDS
+            audio_bytes: Optional[bytes] = None
+            last_status: Dict[str, Any] = {}
+            while time.monotonic() < deadline:
+                result = client.retrieve_music(model, queue_id, delete_media_on_completion=False)
+                if isinstance(result, (bytes, bytearray)):
+                    audio_bytes = bytes(result)
+                    break
+                last_status = result
+                status = str(result.get("status") or result.get("state") or "").upper()
+                if status in {"FAILED", "ERROR", "CANCELLED", "CANCELED"}:
+                    raise VeniceMusicError("Venice generation failed", payload=result)
+                time.sleep(max(1, VENICE_POLL_INTERVAL_SECONDS))
+            if audio_bytes is None:
+                raise VeniceMusicTimeout("Venice generation timed out", payload=last_status)
+            raw_path.write_bytes(audio_bytes)
+            # Guess extension for easier debugging; final output is always mastered MP3.
+            if audio_bytes[:3] == b"ID3":
+                raw_audio_path = raw_path.with_suffix(".mp3")
+            elif audio_bytes[:4] == b"RIFF":
+                raw_audio_path = raw_path.with_suffix(".wav")
+            else:
+                raw_audio_path = raw_path.with_suffix(".audio")
+            raw_path.replace(raw_audio_path)
+            master_ai_audio(raw_audio_path, mp3_path, VENICE_DURATION_SECONDS)
+            if VENICE_COMPLETE_AFTER_DOWNLOAD:
+                try:
+                    client.complete(model, queue_id)
+                except Exception as exc:
+                    logger.warning("Venice complete failed without secrets: %s", type(exc).__name__)
+            elapsed = time.monotonic() - started
+            debug = {"backend": "venice", "model": model, "queue_id": queue_id, "quote_usd": quote_usd, "style": actual_style, "duration": VENICE_DURATION_SECONDS, "processing_time": round(elapsed, 2), "analysis": audio_analysis}
+            return ProcessResult(
+                raw_midi_path=Path(audio_analysis.get("raw_midi_path") or arranged_midi_path),
+                arranged_midi_path=Path(audio_analysis.get("raw_midi_path") or arranged_midi_path),
+                mp3_path=mp3_path,
+                duration_seconds=VENICE_DURATION_SECONDS,
+                notes_count=int(audio_analysis.get("note_count") or 0),
+                style=actual_style,
+                style_fa=STYLE_PRESETS[actual_style]["fa"],
+                bpm=float(audio_analysis.get("bpm") or 0),
+                key_name=str(audio_analysis.get("key") or "—"),
+                mood_fa="الهام‌گرفته از ایده‌ی وویس",
+                confidence=float(audio_analysis.get("confidence") or 0),
+                variation_mp3_path=None,
+                debug=debug,
+                backend="venice",
+                model=model,
+                queue_id=queue_id,
+                quote_usd=quote_usd,
+                prompt=prompt,
+                analysis_json=json.dumps(audio_analysis, ensure_ascii=False),
+            )
+
+        if not MIDI_FALLBACK_ENABLED:
+            raise RuntimeError("MIDI fallback is disabled")
         melody = extract_melody(wav_path)
         selected = style if style in STYLE_PRESETS else DEFAULT_STYLE
         actual_style = selected if selected != "random" else random.choice([s for s in STYLE_ORDER if s != "random"])
         analysis = analyze_melody(melody, actual_style)
         arrangement = arrange_song(melody, analysis, actual_style, arranged_midi_path)
         render = render_song(arrangement, mp3_path)
-        variation_path = None
-        if SEND_VARIATION and actual_style != "piano":
-            variation_path = outdir / "song_variation.mp3"
-            render_song(arrangement, variation_path, variation=True)
         elapsed = time.monotonic() - started
-        debug = {**arrangement.debug, "duration": duration, "melody_note_count": melody.melody_note_count, "pitch_range": melody.pitch_range, "density": melody.density, "confidence": melody.confidence_like_score, "processing_time": round(elapsed,2)}
+        debug = {**arrangement.debug, "duration": duration, "melody_note_count": melody.melody_note_count, "pitch_range": melody.pitch_range, "density": melody.density, "confidence": melody.confidence_like_score, "processing_time": round(elapsed,2), "backend": "midi"}
         logger.info("conversion_metrics id=%s %s", conversion_id, json.dumps(debug, ensure_ascii=False))
-        return ProcessResult(melody.raw_midi_path, arrangement.midi_path, render.mp3_path, duration, melody.melody_note_count, actual_style, STYLE_PRESETS[actual_style]["fa"], analysis.bpm, analysis.key_name, analysis.mood_fa, melody.confidence_like_score, variation_path, debug)
+        return ProcessResult(melody.raw_midi_path, arrangement.midi_path, render.mp3_path, duration, melody.melody_note_count, actual_style, STYLE_PRESETS[actual_style]["fa"], analysis.bpm, analysis.key_name, analysis.mood_fa, melody.confidence_like_score, None, debug)
 
 # -----------------------------------------------------------------------------
 # Telegram Bot
@@ -1139,7 +1339,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db.execute("UPDATE conversions SET input_path=? WHERE id=?", [str(input_path), conv_id])
 
     await update.message.reply_text(
-        "⏳ وویس دریافت شد. دارم ملودی رو درمیارم، تنظیم می‌کنم و خروجی حرفه‌ای می‌سازم…",
+        "⏳ وویس دریافت شد. دارم ایده‌ات رو تحلیل می‌کنم و با هوش مصنوعی به آهنگ کامل تبدیلش می‌کنم… ممکنه یکی دو دقیقه طول بکشه.",
         reply_markup=main_keyboard(),
     )
 
@@ -1157,17 +1357,18 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         db.execute("UPDATE conversions SET status='processing', started_at=?, duration_seconds=? WHERE id=?", [now_iso(), actual_duration or 0, conv_id])
 
+        await update.message.reply_text("🎼 تنظیم آهنگ شروع شد. دارم خروجی حرفه‌ای می‌سازم…", reply_markup=main_keyboard())
         result: ProcessResult = await asyncio.to_thread(process_audio_to_song, input_path, conv_id, selected_style)
         db.execute(
-            """UPDATE conversions SET status='done', completed_at=?, wav_path=?, raw_midi_path=?, arranged_midi_path=?, mp3_path=?, variation_mp3_path=?, duration_seconds=?, style=?, bpm=?, detected_key=?, melody_note_count=?, confidence=?, processing_time=?, debug_json=? WHERE id=?""",
+            """UPDATE conversions SET status='done', completed_at=?, wav_path=?, raw_midi_path=?, arranged_midi_path=?, mp3_path=?, variation_mp3_path=?, duration_seconds=?, style=?, bpm=?, detected_key=?, melody_note_count=?, confidence=?, processing_time=?, debug_json=?, backend=?, model=?, queue_id=?, quote_usd=?, prompt=?, processing_seconds=?, analysis_json=? WHERE id=?""",
             [
                 now_iso(),
                 str(OUTPUTS_DIR / str(conv_id) / "input.wav"),
-                str(result.raw_midi_path),
-                str(result.arranged_midi_path),
+                str(result.raw_midi_path) if result.raw_midi_path.exists() else None,
+                str(result.arranged_midi_path) if result.arranged_midi_path.exists() else None,
                 str(result.mp3_path),
                 str(result.variation_mp3_path) if result.variation_mp3_path else None,
-                result.duration_seconds, result.style, result.bpm, result.key_name, result.notes_count, result.confidence, result.debug.get("processing_time"), json.dumps(result.debug, ensure_ascii=False), conv_id,
+                result.duration_seconds, result.style, result.bpm, result.key_name, result.notes_count, result.confidence, result.debug.get("processing_time"), json.dumps(result.debug, ensure_ascii=False), result.backend, result.model, result.queue_id, result.quote_usd, result.prompt, result.debug.get("processing_time"), result.analysis_json, conv_id,
             ],
         )
         db.increment_usage(tg_user.id)
@@ -1175,16 +1376,17 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         caption = (
             "✅ آهنگت آماده شد!\n"
             f"سبک: {result.style_fa}\n"
-            f"گام/حال‌وهوا: {result.key_name} — {result.mood_fa}\n"
-            f"تمپو: {result.bpm:.0f} BPM\n"
-            f"زمان فایل: {result.duration_seconds} ثانیه\n"
-            f"نت‌های ملودی: {result.notes_count}\n\n"
-            "می‌تونی یک وویس دیگه بفرستی یا از منو سبک رو عوض کنی."
+            f"مدل: Venice / {result.model or VENICE_MUSIC_MODEL}\n"
+            f"مدت: حدود {result.duration_seconds} ثانیه\n\n"
+            "یه وویس دیگه بفرست یا از منو سبک رو عوض کن."
         )
+        if result.debug.get("analysis", {}).get("weak_voice"):
+            caption += "\n\n⚠️ وویست خیلی کوتاه یا نامفهوم بود، ولی سعی کردم از حال‌وهواش آهنگ بسازم. برای نتیجه بهتر، ۵ تا ۱۵ ثانیه فقط زمزمه یا ملودی بخون، بدون موزیک پس‌زمینه."
+        if result.backend == "midi":
+            caption = "نسخه ساده آزمایشی ساخته شد، نه خروجی حرفه‌ای.\n\n" + caption
         await update.message.reply_audio(audio=open(result.mp3_path, "rb"), filename="voice2song.mp3", caption=caption)
-        await update.message.reply_document(document=open(result.arranged_midi_path, "rb"), filename="voice2song_arranged.mid")
-        if result.variation_mp3_path and result.variation_mp3_path.exists():
-            await update.message.reply_audio(audio=open(result.variation_mp3_path, "rb"), filename="voice2song_version2.mp3", caption="🎧 نسخه دوم با رنگ صدایی کمی متفاوت")
+        if SEND_MIDI_ADVANCED and result.arranged_midi_path.exists():
+            await update.message.reply_document(document=open(result.arranged_midi_path, "rb"), filename="voice2song_arranged.mid")
     except Exception as exc:
         logger.exception("Conversion failed id=%s", conv_id)
         db.execute(
@@ -1192,7 +1394,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             [str(exc)[:1800], now_iso(), conv_id],
         )
         await update.message.reply_text(
-            "❌ تبدیل انجام نشد. لطفاً یک وویس واضح‌تر، کوتاه‌تر و تک‌ملودی بفرست.\n"
+            "❌ " + persian_venice_error(exc) + "\n"
             f"کد پیگیری: {conv_id}",
             reply_markup=main_keyboard(),
         )
@@ -1412,10 +1614,17 @@ def admin_dashboard():
         "successful_conversions": db.one("SELECT COUNT(*) c FROM conversions WHERE status='done'")["c"],
         "failed_conversions": db.one("SELECT COUNT(*) c FROM conversions WHERE status='failed'")["c"],
         "avg_processing": db.one("SELECT ROUND(AVG(processing_time),1) c FROM conversions WHERE processing_time IS NOT NULL")["c"] or 0,
+        "venice_total": db.one("SELECT COUNT(*) c FROM conversions WHERE backend='venice'")["c"],
+        "venice_success": db.one("SELECT COUNT(*) c FROM conversions WHERE backend='venice' AND status='done'")["c"],
+        "venice_failed": db.one("SELECT COUNT(*) c FROM conversions WHERE backend='venice' AND status='failed'")["c"],
+        "venice_spend": db.one("SELECT COALESCE(ROUND(SUM(quote_usd),4),0) c FROM conversions WHERE backend='venice'")["c"],
+        "venice_avg": db.one("SELECT ROUND(AVG(processing_seconds),1) c FROM conversions WHERE backend='venice' AND processing_seconds IS NOT NULL")["c"] or 0,
     }
     style_stats = db.all("SELECT style, COUNT(*) c FROM conversions WHERE status='done' GROUP BY style ORDER BY c DESC LIMIT 6")
     latest_users = db.all("SELECT * FROM users ORDER BY created_at DESC LIMIT 8")
     latest_conversions = db.all("SELECT c.*,u.username,u.first_name FROM conversions c LEFT JOIN users u ON u.telegram_id=c.telegram_id ORDER BY c.id DESC LIMIT 8")
+    recent_venice = db.all("SELECT * FROM conversions WHERE backend='venice' ORDER BY id DESC LIMIT 10")
+    backend_status = {"configured": bool(VENICE_API_KEY), "model": VENICE_MUSIC_MODEL, "backend": MUSIC_BACKEND}
     body = r"""
     <div class="row g-3 mb-4">
       {% set cards=[('کاربران',stats.users,'bi-people'),('کل تبدیل‌ها',stats.total_conversions,'bi-music-note-list'),('تبدیل موفق',stats.successful_conversions,'bi-check2-circle'),('تبدیل ناموفق',stats.failed_conversions,'bi-x-circle'),('میانگین پردازش',stats.avg_processing|string+' ثانیه','bi-stopwatch'),('درآمد تاییدشده',fmt_num(stats.approved_revenue)+' تومان','bi-cash-stack')] %}
@@ -1423,13 +1632,27 @@ def admin_dashboard():
       <div class="col-6 col-xl-2"><div class="card stat-card p-3 h-100"><div class="d-flex align-items-center gap-3"><div class="icon"><i class="bi {{ icon }}"></i></div><div><div class="text-muted small">{{ label }}</div><div class="h5 fw-bold mb-0">{{ value }}</div></div></div></div></div>
       {% endfor %}
     </div>
+    <div class="card p-3 mb-4">
+      <h2 class="h5 fw-bold mb-3">وضعیت Venice AI</h2>
+      <div class="row g-3">
+        <div class="col-md-3"><strong>وضعیت کلید:</strong> {{ 'تنظیم شده' if backend_status.configured else 'تنظیم نشده' }}</div>
+        <div class="col-md-3"><strong>بک‌اند:</strong> {{ backend_status.backend }}</div>
+        <div class="col-md-3"><strong>مدل فعلی:</strong> {{ backend_status.model }}</div>
+        <div class="col-md-3"><strong>هزینه تخمینی:</strong> ${{ stats.venice_spend }}</div>
+        <div class="col-md-3">کل جاب Venice: {{ stats.venice_total }}</div>
+        <div class="col-md-3">موفق: {{ stats.venice_success }}</div>
+        <div class="col-md-3">ناموفق: {{ stats.venice_failed }}</div>
+        <div class="col-md-3">میانگین زمان: {{ stats.venice_avg }} ثانیه</div>
+      </div>
+    </div>
+    <div class="card p-3 mb-4"><h2 class="h5 fw-bold mb-3">آخرین جاب‌های Venice</h2><div class="table-responsive"><table class="table"><thead><tr><th>کاربر</th><th>سبک</th><th>مدل</th><th>Queue</th><th>Quote</th><th>وضعیت</th><th>مدت</th><th>خطا</th><th>زمان</th></tr></thead><tbody>{% for j in recent_venice %}<tr><td>{{ j.telegram_id }}</td><td>{{ j.style }}</td><td>{{ j.model }}</td><td><small>{{ j.queue_id or '—' }}</small></td><td>{{ j.quote_usd or '—' }}</td><td>{{ j.status }}</td><td>{{ j.duration_seconds or 0 }}s</td><td style="max-width:240px"><small>{{ j.error or '' }}</small></td><td>{{ fmt_dt(j.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div>
     <div class="row g-4">
       <div class="col-lg-4"><div class="card p-3 h-100"><h2 class="h5 fw-bold mb-3">سبک‌های محبوب</h2><div class="table-responsive"><table class="table"><thead><tr><th>سبک</th><th>تعداد</th></tr></thead><tbody>{% for st in style_stats %}<tr><td>{{ STYLE_PRESETS.get(st.style, STYLE_PRESETS['random'])['fa'] if STYLE_PRESETS else st.style }}</td><td>{{ st.c }}</td></tr>{% endfor %}</tbody></table></div></div></div>
       <div class="col-lg-4"><div class="card p-3"><h2 class="h5 fw-bold mb-3">آخرین کاربران</h2><div class="table-responsive"><table class="table"><thead><tr><th>کاربر</th><th>پلن</th><th>عضویت</th></tr></thead><tbody>{% for u in latest_users %}<tr><td><a href="/admin/users/{{ u.telegram_id }}">{{ u.first_name or '' }} @{{ u.username or '-' }}</a><br><small class="text-muted">{{ u.telegram_id }}</small></td><td><span class="badge badge-soft">{{ u.plan_id }}</span></td><td>{{ fmt_dt(u.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div></div>
       <div class="col-lg-4"><div class="card p-3"><h2 class="h5 fw-bold mb-3">آخرین تبدیل‌ها</h2><div class="table-responsive"><table class="table"><thead><tr><th>کد</th><th>کاربر</th><th>وضعیت</th><th>زمان</th></tr></thead><tbody>{% for c in latest_conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div></div>
     </div>
     """
-    return render_admin("داشبورد", "dashboard", body, stats=stats, style_stats=style_stats, latest_users=latest_users, latest_conversions=latest_conversions)
+    return render_admin("داشبورد", "dashboard", body, stats=stats, style_stats=style_stats, latest_users=latest_users, latest_conversions=latest_conversions, recent_venice=recent_venice, backend_status=backend_status)
 
 
 @flask_app.route("/admin/users")
@@ -1620,8 +1843,8 @@ def admin_conversions():
     body = r"""
     <div class="card p-3">
       <div class="d-flex flex-wrap gap-2 mb-3"><a class="btn btn-outline-secondary" href="/admin/conversions">همه</a><a class="btn btn-outline-success" href="/admin/conversions?status=done">موفق</a><a class="btn btn-outline-warning" href="/admin/conversions?status=processing">در حال پردازش</a><a class="btn btn-outline-danger" href="/admin/conversions?status=failed">ناموفق</a></div>
-      <div class="table-responsive"><table class="table table-hover"><thead><tr><th>کد</th><th>کاربر</th><th>نوع</th><th>سبک</th><th>وضعیت</th><th>مدت</th><th>جزئیات/خطا</th><th>زمان</th></tr></thead><tbody>
-      {% for c in conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}<br><small>{{ c.telegram_id }}</small></td><td>{{ c.input_kind }}</td><td>{{ STYLE_PRESETS.get(c.style, STYLE_PRESETS['random'])['fa'] }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ c.duration_seconds or 0 }}s</td><td style="max-width:320px"><small>{% if c.error %}{{ c.error }}{% else %}{{ c.detected_key or '—' }} | {{ c.bpm or '' }} BPM | نت: {{ c.melody_note_count or 0 }}{% endif %}</small></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}
+      <div class="table-responsive"><table class="table table-hover"><thead><tr><th>کد</th><th>کاربر</th><th>بک‌اند</th><th>مدل</th><th>Queue</th><th>سبک</th><th>وضعیت</th><th>مدت</th><th>جزئیات/خطا</th><th>زمان</th></tr></thead><tbody>
+      {% for c in conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}<br><small>{{ c.telegram_id }}</small></td><td>{{ c.backend or c.input_kind }}</td><td>{{ c.model or '—' }}</td><td><small>{{ c.queue_id or '—' }}</small></td><td>{{ STYLE_PRESETS.get(c.style, STYLE_PRESETS['random'])['fa'] }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ c.duration_seconds or 0 }}s</td><td style="max-width:320px"><small>{% if c.error %}{{ c.error }}{% else %}{{ c.detected_key or '—' }} | {{ c.bpm or '' }} BPM | نت: {{ c.melody_note_count or 0 }}{% endif %}</small></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}
       </tbody></table></div>
     </div>
     """
@@ -1688,6 +1911,8 @@ def admin_settings():
     body = r"""
     <div class="card p-3">
       <h2 class="h5 fw-bold mb-3">تنظیمات اصلی</h2>
+      <div class="alert alert-info">کلید Venice در پنل نمایش داده نمی‌شود: {{ 'تنظیم شده' if venice_configured else 'تنظیم نشده' }}. برای تغییر مقادیر اجرایی از فایل .env استفاده کن.</div>
+      <div class="card p-3 mb-3 bg-light"><strong>تنظیمات فعلی Venice:</strong><br>مدل: {{ venice_model }} | مدت: {{ venice_duration }} ثانیه | سبک پیش‌فرض: {{ default_style }} | MIDI fallback: {{ midi_fallback }}</div>
       <form method="post">
         <div class="row g-3">
           <div class="col-md-6"><label class="form-label">عنوان ربات</label><input name="bot_title" class="form-control" value="{{ settings.bot_title }}"></div>
@@ -1703,7 +1928,7 @@ def admin_settings():
       </form>
     </div>
     """
-    return render_admin("تنظیمات", "settings", body, settings=settings, admin_user=admin_user)
+    return render_admin("تنظیمات", "settings", body, settings=settings, admin_user=admin_user, venice_configured=bool(VENICE_API_KEY), venice_model=VENICE_MUSIC_MODEL, venice_duration=VENICE_DURATION_SECONDS, default_style=DEFAULT_STYLE, midi_fallback=MIDI_FALLBACK_ENABLED)
 
 
 @flask_app.route("/outputs/<path:filename>")

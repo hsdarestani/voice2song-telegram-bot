@@ -114,3 +114,65 @@ PRODUCT_SPEC_FA.md     طراحی محصول و جریان‌ها
 - پنل را پشت HTTPS و ترجیحاً Nginx قرار بده.
 - از پوشه `data/` بکاپ بگیر.
 - توکن ربات را داخل گیت عمومی قرار نده.
+
+## راه‌اندازی Venice AI برای خروجی حرفه‌ای
+
+از این نسخه به بعد خروجی اصلی ربات با Venice AI Music API ساخته می‌شود. وویس کاربر به Venice آپلود نمی‌شود؛ ربات وویس را محلی به WAV تمیز تبدیل و تحلیل می‌کند، سپس یک پرامپت انگلیسی حرفه‌ای می‌سازد تا Venice یک آهنگ/بیت کامل و تمپودار تولید کند. بنابراین خروجی «الهام‌گرفته از ایده‌ی وویس» است، نه کپی دقیق خام صدای کاربر.
+
+1. کلید API را فقط داخل فایل `.env` قرار بده:
+
+```env
+VENICE_API_KEY=...
+MUSIC_BACKEND=venice
+VENICE_MUSIC_MODEL=ace-step-15
+```
+
+2. سرویس را دوباره بساز و اجرا کن:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+3. تست محصول:
+
+```text
+به ربات /start بفرست، از «🎛 انتخاب سبک» یکی از سبک‌ها را انتخاب کن، سپس ۵ تا ۱۵ ثانیه زمزمه یا ملودی واضح بفرست.
+```
+
+### تنظیمات مهم Venice در `.env`
+
+```env
+VENICE_BASE_URL=https://api.venice.ai/api/v1
+VENICE_DURATION_SECONDS=60
+VENICE_MAX_POLL_SECONDS=360
+VENICE_POLL_INTERVAL_SECONDS=5
+VENICE_USE_QUOTE=true
+VENICE_COMPLETE_AFTER_DOWNLOAD=true
+MIDI_FALLBACK_ENABLED=false
+SEND_MIDI_ADVANCED=false
+```
+
+- اگر `VENICE_API_KEY` خالی باشد، ربات کرش نمی‌کند و به کاربر پیام فارسی خطای سرویس حرفه‌ای نمایش می‌دهد.
+- خروجی نهایی MP3 مستر شده است و صدای خام کاربر داخل فایل نهایی میکس نمی‌شود.
+- رندر MIDI قدیمی به‌صورت پیش‌فرض غیرفعال است و فقط اگر `MIDI_FALLBACK_ENABLED=true` باشد به‌عنوان نسخه ساده آزمایشی استفاده می‌شود.
+- پنل ادمین وضعیت تنظیم بودن Venice، مدل فعلی، آمار جاب‌های Venice، مجموع quoteها و آخرین جاب‌ها را نشان می‌دهد؛ کلید API هرگز نمایش داده نمی‌شود.
+
+### چک‌لیست تست سریع بعد از دیپلوی
+
+```bash
+python3 -m py_compile app.py
+```
+
+```bash
+docker compose down
+docker compose up -d --build
+docker compose logs -f --tail=100
+```
+
+در تلگرام:
+
+1. `/start` را بفرست.
+2. «🎛 انتخاب سبک» را بزن و مثلاً «🔥 ترپ» را انتخاب کن.
+3. یک وویس ۵ تا ۱۵ ثانیه‌ای بدون موزیک پس‌زمینه بفرست.
+4. باید پیام‌های پردازش فارسی را ببینی و در پایان یک MP3 با کپشن فارسی دریافت کنی.
