@@ -8,6 +8,8 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fluidsynth \
+    fluid-soundfont-gm \
     libsndfile1 \
     build-essential \
     git \
