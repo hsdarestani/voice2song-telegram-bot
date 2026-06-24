@@ -1,0 +1,10 @@
+services:
+  voice2song:
+    build: .
+    container_name: voice2song_bot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data

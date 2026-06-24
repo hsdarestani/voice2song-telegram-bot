@@ -1,0 +1,11 @@
+# Python 3.10 or 3.11 recommended
+python-telegram-bot==22.6
+Flask==3.0.3
+Werkzeug==3.0.4
+python-dotenv==1.0.1
+requests==2.32.3
+numpy==1.26.4
+scipy==1.13.1
+pretty_midi==0.2.10
+soundfile==0.12.1
+basic-pitch
