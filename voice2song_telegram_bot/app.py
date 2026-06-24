@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -77,6 +78,13 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 DATA_DIR = Path(os.getenv("DATA_DIR", "data")).resolve()
 TIMEZONE = ZoneInfo(os.getenv("APP_TZ", "Asia/Tehran"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
+DEFAULT_STYLE = os.getenv("DEFAULT_STYLE", "random").strip() or "random"
+SOUNDFONT_PATH = os.getenv("SOUNDFONT_PATH", "").strip()
+MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "30"))
+MIN_MELODY_NOTES = int(os.getenv("MIN_MELODY_NOTES", "5"))
+SEND_VARIATION = os.getenv("SEND_VARIATION", "true").lower() in {"1", "true", "yes", "on"}
+RENDER_QUALITY = os.getenv("RENDER_QUALITY", "standard").strip()
+RAW_VOCAL_MIX = os.getenv("RAW_VOCAL_MIX", "false").lower() in {"1", "true", "yes", "on"}
 
 DB_PATH = DATA_DIR / "voice2song.sqlite3"
 UPLOADS_DIR = DATA_DIR / "uploads"
@@ -95,6 +103,9 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("voice2song")
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 if not BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN is empty. Set it in .env before production run.")
@@ -228,6 +239,7 @@ class DB:
                 last_name TEXT,
                 plan_id TEXT NOT NULL DEFAULT 'free',
                 plan_expires_at TEXT,
+                selected_style TEXT NOT NULL DEFAULT 'random',
                 used_today INTEGER NOT NULL DEFAULT 0,
                 usage_date TEXT NOT NULL DEFAULT '',
                 total_conversions INTEGER NOT NULL DEFAULT 0,
@@ -249,6 +261,14 @@ class DB:
                 raw_midi_path TEXT,
                 arranged_midi_path TEXT,
                 mp3_path TEXT,
+                variation_mp3_path TEXT,
+                style TEXT NOT NULL DEFAULT 'random',
+                bpm REAL,
+                detected_key TEXT,
+                melody_note_count INTEGER DEFAULT 0,
+                confidence REAL,
+                processing_time REAL,
+                debug_json TEXT NOT NULL DEFAULT '',
                 error TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
@@ -279,7 +299,27 @@ class DB:
             """
         )
         self.conn.commit()
+        self.migrate_schema()
         self.seed_defaults()
+
+    def migrate_schema(self) -> None:
+        def add_col(table: str, name: str, ddl: str) -> None:
+            cols = [r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        add_col("users", "selected_style", "selected_style TEXT NOT NULL DEFAULT 'random'")
+        for name, ddl in [
+            ("variation_mp3_path", "variation_mp3_path TEXT"),
+            ("style", "style TEXT NOT NULL DEFAULT 'random'"),
+            ("bpm", "bpm REAL"),
+            ("detected_key", "detected_key TEXT"),
+            ("melody_note_count", "melody_note_count INTEGER DEFAULT 0"),
+            ("confidence", "confidence REAL"),
+            ("processing_time", "processing_time REAL"),
+            ("debug_json", "debug_json TEXT NOT NULL DEFAULT ''"),
+        ]:
+            add_col("conversions", name, ddl)
+        self.conn.commit()
 
     def seed_defaults(self) -> None:
         defaults = {
@@ -461,6 +501,69 @@ BASIC_PITCH_MODEL = None
 BASIC_PITCH_LOCK = threading.RLock()
 PROCESS_SEMAPHORE = threading.Semaphore(MAX_WORKERS)
 
+PERSIAN_WEAK_MELODY_ERROR = "❌ ملودی واضحی پیدا نکردم. لطفاً ۵ تا ۱۵ ثانیه فقط با صدای خودت زمزمه یا بخون، بدون موزیک پس‌زمینه."
+
+STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "lofi": {"fa": "🎧 لوفای", "bpm": (72, 92), "lead": "Electric Piano 1", "pad": "Pad 2 (warm)", "bass": "Acoustic Bass", "fx": "lofi"},
+    "trap": {"fa": "🔥 ترپ", "bpm": (130, 155), "lead": "Lead 2 (sawtooth)", "pad": "Pad 8 (sweep)", "bass": "Synth Bass 2", "fx": "trap"},
+    "dark_pop": {"fa": "🌙 دارک پاپ", "bpm": (86, 116), "lead": "Lead 1 (square)", "pad": "Pad 4 (choir)", "bass": "Synth Bass 1", "fx": "dark"},
+    "electronic": {"fa": "⚡ الکترونیک", "bpm": (118, 132), "lead": "Lead 2 (sawtooth)", "pad": "Pad 3 (polysynth)", "bass": "Synth Bass 1", "fx": "bright"},
+    "piano": {"fa": "🎹 پیانو احساسی", "bpm": (64, 88), "lead": "Acoustic Grand Piano", "pad": "String Ensemble 1", "bass": "Cello", "fx": "soft"},
+    "random": {"fa": "🎲 سورپرایزم کن", "bpm": (80, 128), "lead": "Lead 2 (sawtooth)", "pad": "Pad 2 (warm)", "bass": "Synth Bass 1", "fx": "balanced"},
+}
+STYLE_ORDER = ["lofi", "trap", "dark_pop", "electronic", "piano", "random"]
+NOTE_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+@dataclass
+class MelodyNote:
+    pitch: int
+    start: float
+    end: float
+    velocity: int
+
+@dataclass
+class MelodyData:
+    wav_path: Path
+    raw_midi_path: Path
+    notes: List[MelodyNote]
+    duration: float
+    melody_note_count: int
+    pitch_range: int
+    average_velocity: float
+    density: float
+    confidence_like_score: float
+
+@dataclass
+class AnalysisData:
+    root_pc: int
+    key_name: str
+    mode: str
+    bpm: float
+    mood_fa: str
+    bar_seconds: float
+    duration: float
+    stretch: float
+
+@dataclass
+class ArrangementResult:
+    midi_path: Path
+    raw_midi_path: Path
+    style: str
+    analysis: AnalysisData
+    melody_data: MelodyData
+    lead_note_count: int
+    chord_note_count: int
+    bass_note_count: int
+    drum_note_count: int
+    duration: float
+    debug: Dict[str, Any]
+
+@dataclass
+class RenderResult:
+    mp3_path: Path
+    wav_path: Path
+    variation_mp3_path: Optional[Path] = None
+
 @dataclass
 class ProcessResult:
     raw_midi_path: Path
@@ -468,294 +571,366 @@ class ProcessResult:
     mp3_path: Path
     duration_seconds: int
     notes_count: int
+    style: str
+    style_fa: str
+    bpm: float
+    key_name: str
+    mood_fa: str
+    confidence: float
+    variation_mp3_path: Optional[Path]
+    debug: Dict[str, Any]
 
 
 def convert_to_wav(input_path: Path, wav_path: Path) -> int:
-    """Convert any Telegram audio/voice to mono wav and return duration seconds."""
     wav_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-ac",
-        "1",
-        "-ar",
-        "22050",
-        "-vn",
-        str(wav_path),
-    ]
-    proc = run_cmd(cmd, timeout=240)
+    proc = run_cmd(["ffmpeg", "-y", "-i", str(input_path), "-t", str(MAX_AUDIO_SECONDS), "-ac", "1", "-ar", "22050", "-vn", str(wav_path)], timeout=240)
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg convert failed: " + proc.stderr[-1000:])
     return probe_duration_seconds(wav_path)
 
 
 def probe_duration_seconds(path: Path) -> int:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    proc = run_cmd(cmd, timeout=30)
+    proc = run_cmd(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)], timeout=30)
     if proc.returncode != 0:
         return 0
-    try:
-        return int(math.ceil(float(proc.stdout.strip())))
-    except Exception:
-        return 0
+    try: return int(math.ceil(float(proc.stdout.strip())))
+    except Exception: return 0
 
 
 def basic_pitch_to_midi(wav_path: Path, midi_path: Path) -> int:
-    """Use Spotify Basic Pitch to transcribe audio to MIDI."""
     global BASIC_PITCH_MODEL
     midi_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         from basic_pitch import ICASSP_2022_MODEL_PATH
         from basic_pitch.inference import Model, predict
     except Exception as exc:
-        raise RuntimeError(
-            "Basic Pitch نصب یا قابل اجرا نیست. requirements.txt را نصب کنید. خطا: " + str(exc)
-        ) from exc
-
+        raise RuntimeError("Basic Pitch نصب یا قابل اجرا نیست. requirements.txt را نصب کنید. خطا: " + str(exc)) from exc
     with BASIC_PITCH_LOCK:
         if BASIC_PITCH_MODEL is None:
-            logger.info("Loading Basic Pitch model: %s", ICASSP_2022_MODEL_PATH)
+            logger.info("Loading Basic Pitch model from packaged path")
             BASIC_PITCH_MODEL = Model(ICASSP_2022_MODEL_PATH)
         _model_output, midi_data, note_events = predict(str(wav_path), BASIC_PITCH_MODEL)
-
     midi_data.write(str(midi_path))
     return len(note_events or [])
 
 
-def estimate_root(notes: List[Any]) -> int:
-    if not notes:
-        return 0
-    counts = [0.0] * 12
-    for n in notes:
-        counts[n.pitch % 12] += max(1, n.end - n.start) * max(1, n.velocity)
-    return int(np.argmax(np.array(counts)))
-
-
 def clamp_pitch(pitch: int, lo: int = 24, hi: int = 96) -> int:
-    while pitch < lo:
-        pitch += 12
-    while pitch > hi:
-        pitch -= 12
+    while pitch < lo: pitch += 12
+    while pitch > hi: pitch -= 12
     return int(pitch)
 
 
-def arrange_midi(raw_midi_path: Path, arranged_midi_path: Path) -> Tuple[int, float]:
-    """Make a simple song arrangement around transcribed melody: lead + pad + bass + drums."""
+def _pm_notes(midi_path: Path) -> List[MelodyNote]:
     import pretty_midi
-
-    pm = pretty_midi.PrettyMIDI(str(raw_midi_path))
-    melody_notes: List[Any] = []
+    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    notes = []
     for inst in pm.instruments:
         if not inst.is_drum:
-            melody_notes.extend(inst.notes)
-    melody_notes = sorted(melody_notes, key=lambda n: (n.start, n.pitch))
+            for n in inst.notes:
+                if n.end > n.start:
+                    notes.append(MelodyNote(int(n.pitch), float(n.start), float(n.end), int(n.velocity)))
+    return sorted(notes, key=lambda n: (n.start, n.pitch))
 
-    arranged = pretty_midi.PrettyMIDI(initial_tempo=100)
-    lead = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Lead 2 (sawtooth)"), name="ملودی تبدیل‌شده")
-    pad = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Pad 2 (warm)"), name="پد هارمونی")
-    bass = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Synth Bass 1"), name="بیس")
-    drums = pretty_midi.Instrument(program=0, is_drum=True, name="درام")
 
-    duration = max([n.end for n in melody_notes], default=8.0) + 1.0
-    root = estimate_root(melody_notes)
-    # Major-ish progression: I - vi - IV - V. Works okay for demo arrangement.
-    progression = [0, 9, 5, 7]
-    bar = 2.0
+def clean_melody_notes(notes: List[MelodyNote], duration: float) -> List[MelodyNote]:
+    if not notes: return []
+    min_len = 0.07 if duration < 12 else 0.09
+    notes = [n for n in notes if (n.end - n.start) >= min_len and 35 <= n.pitch <= 92 and n.velocity >= 8]
+    notes.sort(key=lambda n: (n.start, -n.velocity))
+    mono: List[MelodyNote] = []
+    for n in notes:
+        if mono and n.start < mono[-1].end - 0.025:
+            if n.velocity > mono[-1].velocity or (n.end - n.start) > (mono[-1].end - mono[-1].start) * 1.3:
+                mono[-1] = n
+            continue
+        mono.append(n)
+    merged: List[MelodyNote] = []
+    for n in mono:
+        if merged and abs(n.pitch - merged[-1].pitch) <= 1 and n.start - merged[-1].end <= 0.12:
+            prev = merged[-1]
+            prev.end = max(prev.end, n.end)
+            prev.velocity = int((prev.velocity + n.velocity) / 2)
+        else:
+            merged.append(MelodyNote(n.pitch, n.start, n.end, n.velocity))
+    for i in range(1, len(merged)):
+        diff = merged[i].pitch - merged[i-1].pitch
+        if abs(diff) >= 12 and abs(diff) % 12 <= 2:
+            merged[i].pitch -= 12 * round(diff / 12)
+            merged[i].pitch = clamp_pitch(merged[i].pitch, 40, 84)
+    return merged
 
-    for n in melody_notes:
-        start = max(0.0, float(n.start))
-        end = max(start + 0.05, float(n.end))
-        pitch = clamp_pitch(int(n.pitch), 48, 88)
-        velocity = int(max(45, min(112, n.velocity + 8)))
-        lead.notes.append(pretty_midi.Note(velocity=velocity, pitch=pitch, start=start, end=end))
 
+def extract_melody(input_wav: Path) -> MelodyData:
+    raw_midi = input_wav.parent / "melody_raw.mid"
+    basic_pitch_to_midi(input_wav, raw_midi)
+    duration = max(probe_duration_seconds(input_wav), 1)
+    notes = clean_melody_notes(_pm_notes(raw_midi), duration)
+    if not notes:
+        raise ValueError(PERSIAN_WEAK_MELODY_ERROR)
+    pitch_range = max(n.pitch for n in notes) - min(n.pitch for n in notes)
+    avg_vel = float(np.mean([n.velocity for n in notes]))
+    density = len(notes) / max(duration, 1.0)
+    coverage = sum(n.end - n.start for n in notes) / max(duration, 1.0)
+    confidence = max(0.0, min(1.0, (len(notes) / 18) * 0.35 + min(pitch_range / 12, 1) * 0.25 + min(coverage, 0.7) * 0.4))
+    if len(notes) < MIN_MELODY_NOTES or pitch_range < 3 or density > 9 or coverage < 0.08 or confidence < 0.22:
+        raise ValueError(PERSIAN_WEAK_MELODY_ERROR)
+    return MelodyData(input_wav, raw_midi, notes, float(duration), len(notes), pitch_range, avg_vel, density, confidence)
+
+
+def analyze_melody(melody_data: MelodyData, style: str = "random") -> AnalysisData:
+    pcs = np.zeros(12)
+    for n in melody_data.notes:
+        pcs[n.pitch % 12] += (n.end - n.start) * max(n.velocity, 1)
+    root = int(np.argmax(pcs))
+    major_score = pcs[(root+4)%12] + .6*pcs[(root+7)%12] + .35*pcs[(root+11)%12]
+    minor_score = pcs[(root+3)%12] + .6*pcs[(root+7)%12] + .35*pcs[(root+10)%12]
+    mode = "minor" if minor_score > major_score else "major"
+    preset = STYLE_PRESETS.get(style, STYLE_PRESETS["random"])
+    lo, hi = preset["bpm"]
+    gaps = [melody_data.notes[i+1].start - melody_data.notes[i].start for i in range(len(melody_data.notes)-1) if 0.12 <= melody_data.notes[i+1].start - melody_data.notes[i].start <= 2.0]
+    base = 60.0 / (float(np.median(gaps)) if gaps else 0.55)
+    while base < lo: base *= 2
+    while base > hi: base /= 2
+    bpm = float(max(lo, min(hi, base)))
+    mood = "مینور / احساسی" if mode == "minor" else "ماژور / روشن"
+    return AnalysisData(root, f"{NOTE_NAMES[root]} {'minor' if mode=='minor' else 'major'}", mode, bpm, mood, 240.0/bpm, melody_data.duration, 1.0)
+
+
+def _program(name: str) -> int:
+    import pretty_midi
+    try: return pretty_midi.instrument_name_to_program(name)
+    except Exception: return 0
+
+
+def _chord_for_phrase(notes: List[MelodyNote], analysis: AnalysisData) -> Tuple[int, List[int]]:
+    if not notes:
+        root = analysis.root_pc
+    else:
+        weights = np.zeros(12)
+        for n in notes: weights[n.pitch % 12] += n.end - n.start
+        root = int(np.argmax(weights))
+    pcs = {n.pitch % 12 for n in notes}
+    minor = ((root+3)%12 in pcs) or (analysis.mode == "minor" and (root+4)%12 not in pcs)
+    third = 3 if minor else 4
+    tones = [root, (root+third)%12, (root+7)%12]
+    if (root+2)%12 in pcs: tones.append((root+14)%12)  # add9
+    return root, tones
+
+
+def arrange_song(melody_data: MelodyData, analysis_data: AnalysisData, style: str = "random", out_path: Optional[Path] = None) -> ArrangementResult:
+    import pretty_midi
+    if style == "random":
+        style = random.choice([s for s in STYLE_ORDER if s != "random"])
+    preset = STYLE_PRESETS.get(style, STYLE_PRESETS["lofi"])
+    out_path = out_path or (melody_data.wav_path.parent / "song_arranged.mid")
+    pm = pretty_midi.PrettyMIDI(initial_tempo=analysis_data.bpm)
+    lead = pretty_midi.Instrument(program=_program(preset["lead"]), name="lead_cleaned_user_melody")
+    harmony = pretty_midi.Instrument(program=_program(preset["pad"]), name="soft_melody_aware_chords")
+    bass = pretty_midi.Instrument(program=_program(preset["bass"]), name="bass_from_chord_roots")
+    drums = pretty_midi.Instrument(program=0, is_drum=True, name="style_drums")
+    bar = analysis_data.bar_seconds
+    target_min = 12.0 if melody_data.duration < 10 else melody_data.duration
+    loops = max(1, int(math.ceil(target_min / max(melody_data.duration, 1))))
+    duration = min(max(melody_data.duration * loops, target_min), float(MAX_AUDIO_SECONDS) + 4.0)
+    # lead preserves original starts/lengths, repeated if needed
+    for loop in range(loops):
+        offset = loop * melody_data.duration
+        if offset >= duration: break
+        for n in melody_data.notes:
+            st, en = n.start + offset, min(n.end + offset, duration)
+            if st >= duration: continue
+            lead.notes.append(pretty_midi.Note(velocity=int(min(118, max(50, n.velocity+10))), pitch=clamp_pitch(n.pitch, 48, 88), start=st, end=max(st+.06, en)))
+    phrase = bar * 2
+    prev_mid = 60
     t = 0.0
-    chord_index = 0
+    roots: List[int] = []
     while t < duration:
-        degree = progression[chord_index % len(progression)]
-        chord_root_pc = (root + degree) % 12
-        chord_root = clamp_pitch(48 + chord_root_pc, 40, 64)
-        # major/minor triad by progression position
-        third = 3 if degree == 9 else 4
-        chord = [chord_root, chord_root + third, chord_root + 7]
-        for p in chord:
-            pad.notes.append(pretty_midi.Note(velocity=42, pitch=clamp_pitch(p, 48, 72), start=t, end=min(t + bar, duration)))
-        bass.notes.append(pretty_midi.Note(velocity=72, pitch=clamp_pitch(chord_root - 12, 28, 52), start=t, end=min(t + bar * 0.85, duration)))
-        chord_index += 1
-        t += bar
+        segment = [n for n in melody_data.notes if t % melody_data.duration <= n.start < min((t % melody_data.duration)+phrase, melody_data.duration)]
+        root_pc, tones = _chord_for_phrase(segment, analysis_data)
+        roots.append(root_pc)
+        chord_pitches = []
+        for pc in tones[:4]:
+            p = 48 + pc
+            while p - prev_mid > 6: p -= 12
+            while prev_mid - p > 8: p += 12
+            chord_pitches.append(clamp_pitch(p, 45, 74))
+        prev_mid = int(np.mean(chord_pitches)) if chord_pitches else prev_mid
+        for pch in chord_pitches:
+            harmony.notes.append(pretty_midi.Note(velocity=34 if style!='piano' else 48, pitch=pch, start=t, end=min(t+phrase*.92, duration)))
+        br = clamp_pitch(36 + root_pc, 28, 48)
+        if style == "trap":
+            bass.notes.append(pretty_midi.Note(velocity=92, pitch=clamp_pitch(br-12, 24, 42), start=t, end=min(t+phrase*.85, duration)))
+        elif style == "electronic":
+            step = bar/4
+            x=t
+            while x < min(t+phrase, duration):
+                bass.notes.append(pretty_midi.Note(velocity=76, pitch=br, start=x, end=min(x+step*.65, duration))); x += step
+        else:
+            bass.notes.append(pretty_midi.Note(velocity=66, pitch=br, start=t, end=min(t+bar*.9, duration)))
+            if t+bar < duration: bass.notes.append(pretty_midi.Note(velocity=58, pitch=clamp_pitch(br+7,28,52), start=t+bar, end=min(t+phrase*.82,duration)))
+        t += phrase
+    if style != "piano":
+        step = bar/4
+        i = 0; t = 0.0
+        while t < duration:
+            beat = i % 16
+            if style == "electronic":
+                if beat % 4 == 0: drums.notes.append(pretty_midi.Note(velocity=100, pitch=36, start=t, end=t+.08))
+                if beat % 4 == 2: drums.notes.append(pretty_midi.Note(velocity=54, pitch=42, start=t, end=t+.04))
+            elif style == "trap":
+                if beat in (0, 6, 10): drums.notes.append(pretty_midi.Note(velocity=102, pitch=36, start=t, end=t+.08))
+                if beat in (4, 12): drums.notes.append(pretty_midi.Note(velocity=92, pitch=39, start=t, end=t+.08))
+                drums.notes.append(pretty_midi.Note(velocity=42 + (beat%3)*8, pitch=42, start=t, end=t+.035))
+                if beat in (7, 15):
+                    for r in range(3): drums.notes.append(pretty_midi.Note(velocity=34, pitch=42, start=t+r*step/3, end=t+r*step/3+.025))
+            else:
+                if beat in (0, 8): drums.notes.append(pretty_midi.Note(velocity=78 if style=='lofi' else 94, pitch=36, start=t, end=t+.08))
+                if beat in (4, 12): drums.notes.append(pretty_midi.Note(velocity=70 if style=='lofi' else 90, pitch=38, start=t, end=t+.08))
+                if beat % 2 == 0: drums.notes.append(pretty_midi.Note(velocity=36 if style=='lofi' else 48, pitch=42, start=t+(0.02 if style=='lofi' else 0), end=t+.04))
+            t += step; i += 1
+    else:
+        # very light cymbal swells only as MIDI hats
+        for t in np.arange(bar, duration, bar*2): drums.notes.append(pretty_midi.Note(velocity=25, pitch=49, start=float(t), end=float(t)+.2))
+    pm.instruments.extend([lead, harmony, bass, drums])
+    pm.write(str(out_path))
+    debug = {"style": style, "bpm": analysis_data.bpm, "key": analysis_data.key_name, "roots": roots, "lead_notes": len(lead.notes), "chord_notes": len(harmony.notes), "bass_notes": len(bass.notes), "drum_notes": len(drums.notes)}
+    if len(lead.notes) < int(len(melody_data.notes) * 0.85):
+        raise RuntimeError("quality guard: arranged lead lost too many detected melody notes")
+    return ArrangementResult(out_path, melody_data.raw_midi_path, style, analysis_data, melody_data, len(lead.notes), len(harmony.notes), len(bass.notes), len(drums.notes), duration, debug)
 
-    # Simple 4/4 beat: kick on 1&3, snare on 2&4, hats on eighths.
-    beat = 0.5
-    steps = int(math.ceil(duration / beat))
-    for i in range(steps):
-        st = i * beat
-        if i % 4 in (0, 2):
-            drums.notes.append(pretty_midi.Note(velocity=96, pitch=36, start=st, end=st + 0.08))
-        if i % 4 == 2:
-            drums.notes.append(pretty_midi.Note(velocity=88, pitch=38, start=st, end=st + 0.1))
-        drums.notes.append(pretty_midi.Note(velocity=46 if i % 2 else 58, pitch=42, start=st, end=st + 0.04))
 
-    arranged.instruments.extend([lead, pad, bass, drums])
-    arranged.write(str(arranged_midi_path))
-    return len(melody_notes), duration
+def _soundfont() -> Optional[str]:
+    candidates = [SOUNDFONT_PATH, "/usr/share/sounds/sf2/FluidR3_GM.sf2", "/usr/share/soundfonts/FluidR3_GM.sf2"]
+    return next((c for c in candidates if c and Path(c).exists()), None)
 
 
+def render_song(arrangement_result: ArrangementResult, mp3_path: Path, variation: bool = False) -> RenderResult:
+    wav_path = mp3_path.with_suffix(".wav")
+    sf = _soundfont()
+    if sf:
+        proc = run_cmd(["fluidsynth", "-ni", sf, str(arrangement_result.midi_path), "-F", str(wav_path), "-r", "44100"], timeout=240)
+        if proc.returncode != 0:
+            logger.warning("FluidSynth failed, falling back to pretty_midi synth: %s", proc.stderr[-500:])
+            synthesize_midi_to_mp3(arrangement_result.midi_path, wav_path, mp3_path)
+            return RenderResult(mp3_path, wav_path)
+    else:
+        synthesize_midi_to_mp3(arrangement_result.midi_path, wav_path, mp3_path)
+        return RenderResult(mp3_path, wav_path)
+    fx = STYLE_PRESETS.get(arrangement_result.style, STYLE_PRESETS["random"])["fx"]
+    af = "highpass=f=35,lowpass=f=17500,acompressor=threshold=-18dB:ratio=2.5:attack=20:release=180,dynaudnorm=f=150:g=12,alimiter=limit=0.92,afade=t=in:st=0:d=0.04"
+    if fx in {"lofi", "dark", "soft"}: af += ",aecho=0.6:0.25:45:0.12"
+    if variation: af += ",asetrate=44100*1.003,aresample=44100"
+    proc = run_cmd(["ffmpeg", "-y", "-i", str(wav_path), "-af", af, "-codec:a", "libmp3lame", "-b:a", "256k" if RENDER_QUALITY == "high" else "192k", str(mp3_path)], timeout=240)
+    if proc.returncode != 0: raise RuntimeError("ffmpeg mastering failed: " + proc.stderr[-1000:])
+    return RenderResult(mp3_path, wav_path)
+
+# fallback internal synth kept for machines without a SoundFont
 def adsr_envelope(length: int, sr: int, attack: float = 0.01, release: float = 0.08) -> np.ndarray:
-    env = np.ones(length, dtype=np.float32)
-    a = min(length, int(sr * attack))
-    r = min(length, int(sr * release))
-    if a > 1:
-        env[:a] = np.linspace(0, 1, a)
-    if r > 1:
-        env[-r:] *= np.linspace(1, 0, r)
+    env = np.ones(length, dtype=np.float32); a=min(length,int(sr*attack)); r=min(length,int(sr*release))
+    if a>1: env[:a]=np.linspace(0,1,a)
+    if r>1: env[-r:]*=np.linspace(1,0,r)
     return env
 
-
 def add_tone(audio: np.ndarray, sr: int, start: float, end: float, pitch: int, velocity: int, kind: str = "lead") -> None:
-    s = max(0, int(start * sr))
-    e = min(len(audio), int(end * sr))
-    if e <= s:
-        return
-    length = e - s
-    t = np.arange(length, dtype=np.float32) / sr
-    freq = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
-    amp = (velocity / 127.0) * 0.14
-    if kind == "bass":
-        wave = np.sin(2 * np.pi * freq * t) + 0.35 * np.sin(2 * np.pi * freq * 2 * t)
-        amp *= 0.75
-    elif kind == "pad":
-        wave = np.sin(2 * np.pi * freq * t) + 0.22 * np.sin(2 * np.pi * (freq * 1.005) * t)
-        amp *= 0.28
-    else:
-        wave = np.sin(2 * np.pi * freq * t) + 0.25 * np.sin(2 * np.pi * 2 * freq * t) + 0.08 * np.sin(2 * np.pi * 3 * freq * t)
-    env = adsr_envelope(length, sr, attack=0.015 if kind != "pad" else 0.08, release=0.06 if kind != "pad" else 0.18)
-    audio[s:e] += (wave * env * amp).astype(np.float32)
-
+    s=max(0,int(start*sr)); e=min(len(audio),int(end*sr))
+    if e<=s: return
+    t=np.arange(e-s,dtype=np.float32)/sr; freq=440.0*(2.0**((pitch-69)/12.0)); amp=(velocity/127.0)*0.14
+    wave=np.sin(2*np.pi*freq*t)
+    if kind=="bass": wave += .35*np.sin(2*np.pi*freq*2*t); amp*=.8
+    elif kind=="pad": wave += .22*np.sin(2*np.pi*(freq*1.005)*t); amp*=.28
+    else: wave += .25*np.sin(2*np.pi*2*freq*t)+.08*np.sin(2*np.pi*3*freq*t)
+    audio[s:e]+=(wave*adsr_envelope(e-s,sr,.015 if kind!='pad' else .08,.06 if kind!='pad' else .18)*amp).astype(np.float32)
 
 def add_kick(audio: np.ndarray, sr: int, start: float, velocity: int) -> None:
-    s = int(start * sr)
-    length = int(0.18 * sr)
-    e = min(len(audio), s + length)
-    if e <= s:
-        return
-    t = np.arange(e - s, dtype=np.float32) / sr
-    freq = 90 * np.exp(-18 * t) + 38
-    phase = 2 * np.pi * np.cumsum(freq) / sr
-    env = np.exp(-12 * t)
-    audio[s:e] += np.sin(phase) * env * (velocity / 127.0) * 0.7
-
+    s=int(start*sr); e=min(len(audio),s+int(.18*sr))
+    if e<=s: return
+    t=np.arange(e-s,dtype=np.float32)/sr; freq=90*np.exp(-18*t)+38; phase=2*np.pi*np.cumsum(freq)/sr
+    audio[s:e]+=np.sin(phase)*np.exp(-12*t)*(velocity/127.0)*.7
 
 def add_snare(audio: np.ndarray, sr: int, start: float, velocity: int) -> None:
-    s = int(start * sr)
-    length = int(0.16 * sr)
-    e = min(len(audio), s + length)
-    if e <= s:
-        return
-    rng = np.random.default_rng(1234 + s)
-    t = np.arange(e - s, dtype=np.float32) / sr
-    noise = rng.normal(0, 1, e - s).astype(np.float32)
-    tone = np.sin(2 * np.pi * 190 * t) * 0.25
-    env = np.exp(-18 * t)
-    audio[s:e] += (noise * 0.28 + tone) * env * (velocity / 127.0)
-
+    s=int(start*sr); e=min(len(audio),s+int(.16*sr))
+    if e<=s: return
+    rng=np.random.default_rng(1234+s); t=np.arange(e-s,dtype=np.float32)/sr
+    audio[s:e]+=(rng.normal(0,1,e-s).astype(np.float32)*.28+np.sin(2*np.pi*190*t)*.25)*np.exp(-18*t)*(velocity/127.0)
 
 def add_hat(audio: np.ndarray, sr: int, start: float, velocity: int) -> None:
-    s = int(start * sr)
-    length = int(0.055 * sr)
-    e = min(len(audio), s + length)
-    if e <= s:
-        return
-    rng = np.random.default_rng(4321 + s)
-    t = np.arange(e - s, dtype=np.float32) / sr
-    noise = rng.normal(0, 1, e - s).astype(np.float32)
-    env = np.exp(-60 * t)
-    audio[s:e] += noise * env * (velocity / 127.0) * 0.16
-
+    s=int(start*sr); e=min(len(audio),s+int(.055*sr))
+    if e<=s: return
+    rng=np.random.default_rng(4321+s); t=np.arange(e-s,dtype=np.float32)/sr
+    audio[s:e]+=rng.normal(0,1,e-s).astype(np.float32)*np.exp(-60*t)*(velocity/127.0)*.16
 
 def synthesize_midi_to_mp3(midi_path: Path, wav_path: Path, mp3_path: Path) -> None:
-    """Built-in lightweight synth; no paid soundfont required."""
     import pretty_midi
-
-    pm = pretty_midi.PrettyMIDI(str(midi_path))
-    sr = 44100
-    duration = max(pm.get_end_time() + 1.0, 4.0)
-    audio = np.zeros(int(duration * sr), dtype=np.float32)
-
+    pm=pretty_midi.PrettyMIDI(str(midi_path)); sr=44100; duration=max(pm.get_end_time()+1.0,4.0); audio=np.zeros(int(duration*sr),dtype=np.float32)
     for inst in pm.instruments:
         if inst.is_drum:
             for n in inst.notes:
-                if n.pitch == 36:
-                    add_kick(audio, sr, n.start, n.velocity)
-                elif n.pitch in (38, 40):
-                    add_snare(audio, sr, n.start, n.velocity)
-                else:
-                    add_hat(audio, sr, n.start, n.velocity)
+                (add_kick if n.pitch==36 else add_snare if n.pitch in (38,39,40) else add_hat)(audio,sr,n.start,n.velocity)
         else:
-            name = (inst.name or "").lower()
-            kind = "lead"
-            if "bass" in name or "بیس" in name:
-                kind = "bass"
-            elif "pad" in name or "پد" in name:
-                kind = "pad"
-            for n in inst.notes:
-                add_tone(audio, sr, n.start, n.end, n.pitch, n.velocity, kind=kind)
-
-    # Soft limiter / normalization
-    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-    if peak > 0:
-        audio = audio / max(peak, 1.0) * 0.92 if peak > 1.0 else audio * 0.92
-    audio_i16 = np.int16(np.clip(audio, -1, 1) * 32767)
-    wavfile.write(str(wav_path), sr, audio_i16)
-
-    proc = run_cmd(["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", "192k", str(mp3_path)], timeout=240)
-    if proc.returncode != 0:
-        raise RuntimeError("ffmpeg mp3 failed: " + proc.stderr[-1000:])
+            name=(inst.name or '').lower(); kind='bass' if 'bass' in name else 'pad' if 'chord' in name or 'pad' in name else 'lead'
+            for n in inst.notes: add_tone(audio,sr,n.start,n.end,n.pitch,n.velocity,kind)
+    peak=float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak>0: audio=audio/max(peak,1.0)*.92 if peak>1 else audio*.92
+    wavfile.write(str(wav_path),sr,np.int16(np.clip(audio,-1,1)*32767))
+    proc=run_cmd(["ffmpeg","-y","-i",str(wav_path),"-af","highpass=f=35,acompressor,dynaudnorm,alimiter=limit=0.92","-codec:a","libmp3lame","-b:a","192k",str(mp3_path)],timeout=240)
+    if proc.returncode!=0: raise RuntimeError("ffmpeg mp3 failed: "+proc.stderr[-1000:])
 
 
-def process_audio_to_song(input_path: Path, conversion_id: int) -> ProcessResult:
-    """Full pipeline: Telegram audio -> wav -> Basic Pitch MIDI -> arranged MIDI -> MP3."""
+def process_audio_to_song(input_path: Path, conversion_id: int, style: str = "random") -> ProcessResult:
+    if RAW_VOCAL_MIX:
+        logger.warning("RAW_VOCAL_MIX is true but raw vocal mixing is intentionally not implemented/enabled in this pipeline")
+    started = time.monotonic()
     with PROCESS_SEMAPHORE:
-        outdir = OUTPUTS_DIR / str(conversion_id)
-        outdir.mkdir(parents=True, exist_ok=True)
-        wav_path = outdir / "input.wav"
-        raw_midi_path = outdir / "melody_raw.mid"
-        arranged_midi_path = outdir / "song_arranged.mid"
-        synth_wav_path = outdir / "song.wav"
-        mp3_path = outdir / "song.mp3"
-
+        outdir = OUTPUTS_DIR / str(conversion_id); outdir.mkdir(parents=True, exist_ok=True)
+        wav_path = outdir / "input.wav"; arranged_midi_path = outdir / "song_arranged.mid"; mp3_path = outdir / "song.mp3"
         duration = convert_to_wav(input_path, wav_path)
-        notes_count = basic_pitch_to_midi(wav_path, raw_midi_path)
-        melody_count, _arr_duration = arrange_midi(raw_midi_path, arranged_midi_path)
-        synthesize_midi_to_mp3(arranged_midi_path, synth_wav_path, mp3_path)
-        return ProcessResult(raw_midi_path, arranged_midi_path, mp3_path, duration, max(notes_count, melody_count))
+        melody = extract_melody(wav_path)
+        selected = style if style in STYLE_PRESETS else DEFAULT_STYLE
+        actual_style = selected if selected != "random" else random.choice([s for s in STYLE_ORDER if s != "random"])
+        analysis = analyze_melody(melody, actual_style)
+        arrangement = arrange_song(melody, analysis, actual_style, arranged_midi_path)
+        render = render_song(arrangement, mp3_path)
+        variation_path = None
+        if SEND_VARIATION and actual_style != "piano":
+            variation_path = outdir / "song_variation.mp3"
+            render_song(arrangement, variation_path, variation=True)
+        elapsed = time.monotonic() - started
+        debug = {**arrangement.debug, "duration": duration, "melody_note_count": melody.melody_note_count, "pitch_range": melody.pitch_range, "density": melody.density, "confidence": melody.confidence_like_score, "processing_time": round(elapsed,2)}
+        logger.info("conversion_metrics id=%s %s", conversion_id, json.dumps(debug, ensure_ascii=False))
+        return ProcessResult(melody.raw_midi_path, arrangement.midi_path, render.mp3_path, duration, melody.melody_note_count, actual_style, STYLE_PRESETS[actual_style]["fa"], analysis.bpm, analysis.key_name, analysis.mood_fa, melody.confidence_like_score, variation_path, debug)
 
 # -----------------------------------------------------------------------------
 # Telegram Bot
 # -----------------------------------------------------------------------------
-BTN_CONVERT = "🎙 تبدیل وویس به آهنگ"
+BTN_CONVERT = "🎙 ساخت آهنگ با وویس"
+BTN_STYLE = "🎛 انتخاب سبک"
 BTN_PLANS = "💳 خرید اشتراک"
-BTN_STATUS = "📊 وضعیت من"
-BTN_HELP = "❓ راهنما"
+BTN_STATUS = "👤 حساب من"
+BTN_HELP = "ℹ️ راهنما"
 BTN_SUPPORT = "☎️ پشتیبانی"
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BTN_CONVERT, BTN_PLANS], [BTN_STATUS, BTN_HELP], [BTN_SUPPORT]],
+        [[BTN_CONVERT, BTN_STYLE], [BTN_PLANS, BTN_STATUS], [BTN_HELP, BTN_SUPPORT]],
         resize_keyboard=True,
         one_time_keyboard=False,
         input_field_placeholder="وویس یا فایل صوتی بفرست…",
+    )
+
+
+def style_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(STYLE_PRESETS[key]["fa"], callback_data=f"style:{key}")] for key in STYLE_ORDER]
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_style_message(update: Update) -> None:
+    row = db.one("SELECT selected_style FROM users WHERE telegram_id=?", [update.effective_user.id])
+    current = (row["selected_style"] if row else DEFAULT_STYLE) or "random"
+    current_fa = STYLE_PRESETS.get(current, STYLE_PRESETS["random"])["fa"]
+    await update.message.reply_text(
+        f"🎛 انتخاب سبک تنظیم آهنگ\n\nسبک فعلی شما: {current_fa}\nیکی از سبک‌ها را انتخاب کن؛ اگر انتخاب نکنی، «سورپرایزم کن» استفاده می‌شود.",
+        reply_markup=style_keyboard(),
     )
 
 
@@ -780,6 +955,7 @@ def status_text(telegram_id: int) -> str:
         f"استفاده امروز: {u['used_today']} از {u['daily_limit']}\n"
         f"حداکثر طول هر فایل: {u['max_seconds']} ثانیه\n"
         f"تعداد کل تبدیل‌ها: {u['total_conversions']}\n"
+        f"سبک انتخابی: {STYLE_PRESETS.get(u['selected_style'] or 'random', STYLE_PRESETS['random'])['fa']}\n"
         f"انقضای پلن: {exp}"
     )
 
@@ -822,14 +998,16 @@ async def show_plans_message(update: Update) -> None:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.ensure_user(update.effective_user)
     text = (update.message.text or "").strip()
-    menu_texts = {BTN_CONVERT, BTN_PLANS, BTN_STATUS, BTN_HELP, BTN_SUPPORT}
+    menu_texts = {BTN_CONVERT, BTN_STYLE, BTN_PLANS, BTN_STATUS, BTN_HELP, BTN_SUPPORT}
     if text not in menu_texts and await handle_receipt(update, context):
         return
     if text == BTN_CONVERT:
         await update.message.reply_text(
-            "🎙 عالی! حالا یک وویس، آواز یا فایل صوتی بفرست. بهتره صدا واضح و تک‌ملودی باشه.",
+            "🎙 عالی! حالا ۵ تا ۱۵ ثانیه فقط با صدای خودت زمزمه یا بخون؛ بدون موزیک پس‌زمینه و تا حد ممکن واضح.",
             reply_markup=main_keyboard(),
         )
+    elif text == BTN_STYLE:
+        await show_style_message(update)
     elif text == BTN_PLANS:
         await show_plans_message(update)
     elif text == BTN_STATUS:
@@ -852,6 +1030,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = q.data or ""
     if data == "status":
         await q.edit_message_text(status_text(q.from_user.id))
+        return
+    if data.startswith("style:"):
+        style = data.split(":", 1)[1]
+        if style not in STYLE_PRESETS:
+            await q.edit_message_text("سبک پیدا نشد.")
+            return
+        db.execute("UPDATE users SET selected_style=? WHERE telegram_id=?", [style, q.from_user.id])
+        await q.edit_message_text(f"✅ سبک شما روی {STYLE_PRESETS[style]['fa']} تنظیم شد. حالا یک وویس واضح بفرست.")
         return
     if data.startswith("buy:"):
         plan_id = data.split(":", 1)[1]
@@ -943,16 +1129,17 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("⚠️ " + reason + "\nبرای افزایش سقف، بخش خرید اشتراک را ببین.", reply_markup=main_keyboard())
         return
 
+    selected_style = (db.one("SELECT selected_style FROM users WHERE telegram_id=?", [tg_user.id])["selected_style"] or DEFAULT_STYLE)
     conv_id = db.execute(
-        """INSERT INTO conversions(telegram_id,input_kind,status,duration_seconds,created_at)
-        VALUES(?,?,?,?,?)""",
-        [tg_user.id, kind, "queued", duration or 0, now_iso()],
+        """INSERT INTO conversions(telegram_id,input_kind,status,duration_seconds,style,created_at)
+        VALUES(?,?,?,?,?,?)""",
+        [tg_user.id, kind, "queued", duration or 0, selected_style, now_iso()],
     ).lastrowid
     input_path = UPLOADS_DIR / f"{conv_id}{ext}"
     db.execute("UPDATE conversions SET input_path=? WHERE id=?", [str(input_path), conv_id])
 
     await update.message.reply_text(
-        "⏳ فایل دریافت شد. دارم ملودی رو تشخیص می‌دم و آهنگ می‌سازم… ممکنه چند دقیقه طول بکشه.",
+        "⏳ وویس دریافت شد. دارم ملودی رو درمیارم، تنظیم می‌کنم و خروجی حرفه‌ای می‌سازم…",
         reply_markup=main_keyboard(),
     )
 
@@ -970,30 +1157,34 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         db.execute("UPDATE conversions SET status='processing', started_at=?, duration_seconds=? WHERE id=?", [now_iso(), actual_duration or 0, conv_id])
 
-        result: ProcessResult = await asyncio.to_thread(process_audio_to_song, input_path, conv_id)
+        result: ProcessResult = await asyncio.to_thread(process_audio_to_song, input_path, conv_id, selected_style)
         db.execute(
-            """UPDATE conversions SET status='done', completed_at=?, wav_path=?, raw_midi_path=?, arranged_midi_path=?, mp3_path=?, duration_seconds=? WHERE id=?""",
+            """UPDATE conversions SET status='done', completed_at=?, wav_path=?, raw_midi_path=?, arranged_midi_path=?, mp3_path=?, variation_mp3_path=?, duration_seconds=?, style=?, bpm=?, detected_key=?, melody_note_count=?, confidence=?, processing_time=?, debug_json=? WHERE id=?""",
             [
                 now_iso(),
                 str(OUTPUTS_DIR / str(conv_id) / "input.wav"),
                 str(result.raw_midi_path),
                 str(result.arranged_midi_path),
                 str(result.mp3_path),
-                result.duration_seconds,
-                conv_id,
+                str(result.variation_mp3_path) if result.variation_mp3_path else None,
+                result.duration_seconds, result.style, result.bpm, result.key_name, result.notes_count, result.confidence, result.debug.get("processing_time"), json.dumps(result.debug, ensure_ascii=False), conv_id,
             ],
         )
         db.increment_usage(tg_user.id)
 
         caption = (
             "✅ آهنگت آماده شد!\n"
-            f"نت‌های تشخیص‌داده‌شده: حدود {result.notes_count}\n"
-            f"زمان فایل: {result.duration_seconds} ثانیه\n\n"
-            f"{db.setting('processing_note')}"
+            f"سبک: {result.style_fa}\n"
+            f"گام/حال‌وهوا: {result.key_name} — {result.mood_fa}\n"
+            f"تمپو: {result.bpm:.0f} BPM\n"
+            f"زمان فایل: {result.duration_seconds} ثانیه\n"
+            f"نت‌های ملودی: {result.notes_count}\n\n"
+            "می‌تونی یک وویس دیگه بفرستی یا از منو سبک رو عوض کنی."
         )
         await update.message.reply_audio(audio=open(result.mp3_path, "rb"), filename="voice2song.mp3", caption=caption)
         await update.message.reply_document(document=open(result.arranged_midi_path, "rb"), filename="voice2song_arranged.mid")
-        await update.message.reply_document(document=open(result.raw_midi_path, "rb"), filename="voice2song_raw_melody.mid")
+        if result.variation_mp3_path and result.variation_mp3_path.exists():
+            await update.message.reply_audio(audio=open(result.variation_mp3_path, "rb"), filename="voice2song_version2.mp3", caption="🎧 نسخه دوم با رنگ صدایی کمی متفاوت")
     except Exception as exc:
         logger.exception("Conversion failed id=%s", conv_id)
         db.execute(
@@ -1119,6 +1310,7 @@ def render_admin(title: str, active: str, body_template: str, **context: Any) ->
     body = render_template_string(
         body_template,
         db=db,
+        STYLE_PRESETS=STYLE_PRESETS,
         fmt_num=fmt_num,
         fmt_dt=fmt_dt,
         now_iso=now_iso,
@@ -1216,22 +1408,28 @@ def admin_dashboard():
         "done_today": db.one("SELECT COUNT(*) c FROM conversions WHERE status='done' AND substr(created_at,1,10)=?", [today])["c"],
         "pending_payments": db.one("SELECT COUNT(*) c FROM payment_receipts WHERE status='pending'")["c"],
         "approved_revenue": db.one("SELECT COALESCE(SUM(amount_toman),0) c FROM payment_receipts WHERE status='approved'")["c"],
+        "total_conversions": db.one("SELECT COUNT(*) c FROM conversions")["c"],
+        "successful_conversions": db.one("SELECT COUNT(*) c FROM conversions WHERE status='done'")["c"],
+        "failed_conversions": db.one("SELECT COUNT(*) c FROM conversions WHERE status='failed'")["c"],
+        "avg_processing": db.one("SELECT ROUND(AVG(processing_time),1) c FROM conversions WHERE processing_time IS NOT NULL")["c"] or 0,
     }
+    style_stats = db.all("SELECT style, COUNT(*) c FROM conversions WHERE status='done' GROUP BY style ORDER BY c DESC LIMIT 6")
     latest_users = db.all("SELECT * FROM users ORDER BY created_at DESC LIMIT 8")
     latest_conversions = db.all("SELECT c.*,u.username,u.first_name FROM conversions c LEFT JOIN users u ON u.telegram_id=c.telegram_id ORDER BY c.id DESC LIMIT 8")
     body = r"""
     <div class="row g-3 mb-4">
-      {% set cards=[('کاربران',stats.users,'bi-people'),('کاربران پولی',stats.paid_users,'bi-gem'),('تبدیل‌های امروز',stats.conversions_today,'bi-music-note'),('موفق امروز',stats.done_today,'bi-check2-circle'),('رسیدهای معلق',stats.pending_payments,'bi-hourglass-split'),('درآمد تاییدشده',fmt_num(stats.approved_revenue)+' تومان','bi-cash-stack')] %}
+      {% set cards=[('کاربران',stats.users,'bi-people'),('کل تبدیل‌ها',stats.total_conversions,'bi-music-note-list'),('تبدیل موفق',stats.successful_conversions,'bi-check2-circle'),('تبدیل ناموفق',stats.failed_conversions,'bi-x-circle'),('میانگین پردازش',stats.avg_processing|string+' ثانیه','bi-stopwatch'),('درآمد تاییدشده',fmt_num(stats.approved_revenue)+' تومان','bi-cash-stack')] %}
       {% for label,value,icon in cards %}
       <div class="col-6 col-xl-2"><div class="card stat-card p-3 h-100"><div class="d-flex align-items-center gap-3"><div class="icon"><i class="bi {{ icon }}"></i></div><div><div class="text-muted small">{{ label }}</div><div class="h5 fw-bold mb-0">{{ value }}</div></div></div></div></div>
       {% endfor %}
     </div>
     <div class="row g-4">
-      <div class="col-lg-6"><div class="card p-3"><h2 class="h5 fw-bold mb-3">آخرین کاربران</h2><div class="table-responsive"><table class="table"><thead><tr><th>کاربر</th><th>پلن</th><th>عضویت</th></tr></thead><tbody>{% for u in latest_users %}<tr><td><a href="/admin/users/{{ u.telegram_id }}">{{ u.first_name or '' }} @{{ u.username or '-' }}</a><br><small class="text-muted">{{ u.telegram_id }}</small></td><td><span class="badge badge-soft">{{ u.plan_id }}</span></td><td>{{ fmt_dt(u.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div></div>
-      <div class="col-lg-6"><div class="card p-3"><h2 class="h5 fw-bold mb-3">آخرین تبدیل‌ها</h2><div class="table-responsive"><table class="table"><thead><tr><th>کد</th><th>کاربر</th><th>وضعیت</th><th>زمان</th></tr></thead><tbody>{% for c in latest_conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div></div>
+      <div class="col-lg-4"><div class="card p-3 h-100"><h2 class="h5 fw-bold mb-3">سبک‌های محبوب</h2><div class="table-responsive"><table class="table"><thead><tr><th>سبک</th><th>تعداد</th></tr></thead><tbody>{% for st in style_stats %}<tr><td>{{ STYLE_PRESETS.get(st.style, STYLE_PRESETS['random'])['fa'] if STYLE_PRESETS else st.style }}</td><td>{{ st.c }}</td></tr>{% endfor %}</tbody></table></div></div></div>
+      <div class="col-lg-4"><div class="card p-3"><h2 class="h5 fw-bold mb-3">آخرین کاربران</h2><div class="table-responsive"><table class="table"><thead><tr><th>کاربر</th><th>پلن</th><th>عضویت</th></tr></thead><tbody>{% for u in latest_users %}<tr><td><a href="/admin/users/{{ u.telegram_id }}">{{ u.first_name or '' }} @{{ u.username or '-' }}</a><br><small class="text-muted">{{ u.telegram_id }}</small></td><td><span class="badge badge-soft">{{ u.plan_id }}</span></td><td>{{ fmt_dt(u.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div></div>
+      <div class="col-lg-4"><div class="card p-3"><h2 class="h5 fw-bold mb-3">آخرین تبدیل‌ها</h2><div class="table-responsive"><table class="table"><thead><tr><th>کد</th><th>کاربر</th><th>وضعیت</th><th>زمان</th></tr></thead><tbody>{% for c in latest_conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}</tbody></table></div></div></div>
     </div>
     """
-    return render_admin("داشبورد", "dashboard", body, stats=stats, latest_users=latest_users, latest_conversions=latest_conversions)
+    return render_admin("داشبورد", "dashboard", body, stats=stats, style_stats=style_stats, latest_users=latest_users, latest_conversions=latest_conversions)
 
 
 @flask_app.route("/admin/users")
@@ -1422,8 +1620,8 @@ def admin_conversions():
     body = r"""
     <div class="card p-3">
       <div class="d-flex flex-wrap gap-2 mb-3"><a class="btn btn-outline-secondary" href="/admin/conversions">همه</a><a class="btn btn-outline-success" href="/admin/conversions?status=done">موفق</a><a class="btn btn-outline-warning" href="/admin/conversions?status=processing">در حال پردازش</a><a class="btn btn-outline-danger" href="/admin/conversions?status=failed">ناموفق</a></div>
-      <div class="table-responsive"><table class="table table-hover"><thead><tr><th>کد</th><th>کاربر</th><th>نوع</th><th>وضعیت</th><th>مدت</th><th>خطا</th><th>زمان</th></tr></thead><tbody>
-      {% for c in conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}<br><small>{{ c.telegram_id }}</small></td><td>{{ c.input_kind }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ c.duration_seconds or 0 }}s</td><td style="max-width:320px"><small>{{ c.error or '' }}</small></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}
+      <div class="table-responsive"><table class="table table-hover"><thead><tr><th>کد</th><th>کاربر</th><th>نوع</th><th>سبک</th><th>وضعیت</th><th>مدت</th><th>جزئیات/خطا</th><th>زمان</th></tr></thead><tbody>
+      {% for c in conversions %}<tr><td>#{{ c.id }}</td><td>{{ c.first_name or '' }} @{{ c.username or '-' }}<br><small>{{ c.telegram_id }}</small></td><td>{{ c.input_kind }}</td><td>{{ STYLE_PRESETS.get(c.style, STYLE_PRESETS['random'])['fa'] }}</td><td><span class="badge text-bg-{{ 'success' if c.status=='done' else 'danger' if c.status=='failed' else 'warning' }}">{{ c.status }}</span></td><td>{{ c.duration_seconds or 0 }}s</td><td style="max-width:320px"><small>{% if c.error %}{{ c.error }}{% else %}{{ c.detected_key or '—' }} | {{ c.bpm or '' }} BPM | نت: {{ c.melody_note_count or 0 }}{% endif %}</small></td><td>{{ fmt_dt(c.created_at) }}</td></tr>{% endfor %}
       </tbody></table></div>
     </div>
     """
